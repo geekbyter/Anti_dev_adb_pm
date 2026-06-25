@@ -1,0 +1,7 @@
+id=anti_dev_pm_zygisk
+name=Anti-Dev-Adb-pm
+version=v2.4.0
+versionCode=20400
+author=geekbyte
+description=DuckDetector-scoped Zygisk observation bypass: sanitizes Binder/PackageManager/Settings, Duck native root/SU snapshots, getprop, property area, memory maps, and risky-app/manager probes. No pm hide, no appops, no ADB disable.
+updateJson=
