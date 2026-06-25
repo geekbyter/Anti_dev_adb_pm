@@ -24,13 +24,20 @@ jobs:
         run: |
           set -eux
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "ndk;29.0.14206865"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Fix line endings
+        shell: bash
+        run: |
+          # CRLF in source files causes ndk-build's Make to choke on .d files
+          find jni -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.mk' \) -exec sed -i 's/\r$//' {} +
 
       - name: Build native libraries
         shell: bash
         run: |
           set -eux
+          rm -rf obj libs module/zygisk
           "$ANDROID_NDK_HOME/ndk-build" -C jni
 
       - name: Package Magisk module
