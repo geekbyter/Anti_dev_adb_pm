@@ -41,11 +41,23 @@ jobs:
           "$ANDROID_NDK_HOME/ndk-build" -C jni
 
       - name: Package Magisk module
-        shell: pwsh
-        run: ./tools/package.ps1
+        shell: bash
+        run: |
+          set -eux
+          # Copy built .so files to module/zygisk/
+          mkdir -p module/zygisk
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            cp "libs/$abi/libanti_dev_pm_zygisk.so" "module/zygisk/$abi.so"
+          done
+          # Read version from module.prop
+          version=$(grep '^version=' module/module.prop | head -1 | cut -d= -f2)
+          zip_name="anti_dev_pm_zygisk-${version}.zip"
+          # Create zip from module/ contents
+          cd module && zip -r "../$zip_name" . -x "*.DS_Store" "*/\.*" && cd ..
+          ls -lh "$zip_name"
 
       - name: Upload module zip
         uses: actions/upload-artifact@v4
         with:
           name: anti_dev_pm_zygisk
-          path: anti_dev_pm_zygisk-v*.zip
+          path: anti_dev_pm_zygisk-*.zip
