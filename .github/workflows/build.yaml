@@ -1,0 +1,44 @@
+name: Build anti_dev_pm_zygisk
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -eux
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Build native libraries
+        shell: bash
+        run: |
+          set -eux
+          "$ANDROID_NDK_HOME/ndk-build" -C jni
+
+      - name: Package Magisk module
+        shell: pwsh
+        run: ./tools/package.ps1
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: anti_dev_pm_zygisk
+          path: ../anti_dev_pm_zygisk-v*.zip
