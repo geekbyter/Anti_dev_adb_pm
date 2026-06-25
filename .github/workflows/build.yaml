@@ -48,4 +48,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: anti_dev_pm_zygisk
-          path: ../anti_dev_pm_zygisk-v*.zip
+          path: anti_dev_pm_zygisk-v*.zip
