@@ -6,6 +6,21 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
+function Remove-GeneratedDir([string]$RelativePath) {
+    $target = Join-Path $projectRoot $RelativePath
+    if (-not (Test-Path -LiteralPath $target)) {
+        return
+    }
+    $resolved = (Resolve-Path -LiteralPath $target).Path
+    if (-not $resolved.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove path outside project: $resolved"
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+}
+
+Remove-GeneratedDir "obj"
+Remove-GeneratedDir "libs"
+
 if (-not $NdkBuild) {
     $candidates = @()
     if ($env:ANDROID_NDK_HOME) { $candidates += (Join-Path $env:ANDROID_NDK_HOME "ndk-build.cmd") }
