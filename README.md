@@ -1,7 +1,7 @@
 # anti_dev_pm_zygisk
 
 Author: geekbyte  
-Version: v2.4.0
+Version: v2.4.3
 
 Standalone Zygisk module for DuckDetector visibility checks.
 
@@ -97,6 +97,28 @@ The module also suppresses Duck-visible path evidence such as `/data/adb`,
 `/sdcard/Android/data/<pkg>`, `/sdcard/Android/obb/<pkg>`, APK paths containing
 these package names, and several known risky-app residue paths.
 
+## Android 16 Compatibility
+
+v2.4.1 keeps the real `Build.VERSION.SDK_INT` and `RESOURCES_SDK_INT` on
+Android 16/API 36 and newer. Older builds used a process-local SDK downgrade for
+some DuckDetector inventory checks, but that can break new framework/UI
+compatibility paths and cause a black screen on Android 16. Other package,
+property, Binder, and native probe hooks are unchanged.
+
+v2.4.2 further narrows Zygisk activation on Android 16-era DuckDetector builds.
+The module runs in the main DuckDetector process and the explicit
+`:zygisk_fd_detector` helper only. It skips DuckDetector app-zygote and
+virtualization/isolated helper processes, because those processes require a
+single-threaded zygote state or intentionally run sacrificial native probes.
+Injecting delayed JNI/PLT passes there can make DuckDetector open to a black
+screen even when the main process is healthy.
+
+v2.4.3 disables native PLT hooks and delayed hook retries on Android 16/API 36
+and newer. On these builds, repeated PLT registration attempts fail and can
+disturb HWUI/Vulkan surface timing. The module keeps the process-local JNI
+hooks for `SystemProperties` and DuckDetector native bridge snapshots, but does
+not keep a delayed worker thread in the app process.
+
 ## Why v2.1 Changed
 
 `Settings.Global/Secure.getInt` and `ApplicationPackageManager` methods are
@@ -125,19 +147,19 @@ powershell -ExecutionPolicy Bypass -File .\tools\package.ps1
 Output:
 
 ```text
-C:\Users\admin\Documents\dirtysepolicy\anti_dev_pm_zygisk-v2.4.0.zip
+C:\Users\admin\Documents\dirtysepolicy\anti_dev_pm_zygisk-v2.4.3.zip
 ```
 
 ## GitHub Cloud Build
 
 Push this folder as the repository root. The workflow at
-`.github/workflows/build.yml` installs Android NDK `29.0.14206865`, runs
+`.github/workflows/build.yml` installs Android NDK `27.2.12479018`, runs
 `ndk-build -C jni`, packages the Magisk module, and uploads the zip artifact.
 
 ## Install
 
 ```sh
-su -c "magisk --install-module /sdcard/anti_dev_pm_zygisk-v2.4.0.zip"
+su -c "magisk --install-module /sdcard/anti_dev_pm_zygisk-v2.4.3.zip"
 su -c reboot
 ```
 

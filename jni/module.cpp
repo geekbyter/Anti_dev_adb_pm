@@ -1,4 +1,4 @@
-// anti_dev_pm_zygisk v2.4.0
+// anti_dev_pm_zygisk v2.4.3
 // DuckDetector-scoped observation bypass:
 //   - Does not hide, disable, stop, or uninstall any real package/service.
 //   - Spoofs Duck-visible ADB/developer system properties.
@@ -26,7 +26,7 @@
 
 #include "zygisk.hpp"
 
-#define MODULE_VERSION "v2.4.0"
+#define MODULE_VERSION "v2.4.3"
 #define LOG_TAG "DuckVisBypass"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -62,6 +62,7 @@ static JavaVM *g_vm = nullptr;
 static pthread_mutex_t g_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_jni_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_hooks_started = false;
+static bool g_jni_installed = false;
 static char g_app_name[128] = "?";
 
 // ---------------------------------------------------------------------------
@@ -182,6 +183,19 @@ static bool prop_to_bool(const char *v, bool def) {
     return strcmp(v, "1") == 0 || strcmp(v, "true") == 0 ||
            strcmp(v, "TRUE") == 0 || strcmp(v, "y") == 0 ||
            strcmp(v, "yes") == 0 || strcmp(v, "on") == 0;
+}
+
+static int get_runtime_sdk(JNIEnv *env) {
+    if (!env) return -1;
+    jclass version = env->FindClass("android/os/Build$VERSION");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (!version) return -1;
+    jfieldID sdk = env->GetStaticFieldID(version, "SDK_INT", "I");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    int value = -1;
+    if (sdk) value = env->GetStaticIntField(version, sdk);
+    env->DeleteLocalRef(version);
+    return value;
 }
 
 static int (*o_sys_prop_get)(const char *, char *) = nullptr;
@@ -1771,25 +1785,37 @@ static int register_plt_hooks() {
 static void install_jni_hooks(JNIEnv *env) {
     if (!g_api || !env) return;
     pthread_mutex_lock(&g_jni_lock);
+    if (g_jni_installed) {
+        pthread_mutex_unlock(&g_jni_lock);
+        return;
+    }
 
     {
         jclass version = env->FindClass("android/os/Build$VERSION");
         if (env->ExceptionCheck()) env->ExceptionClear();
         if (version) {
+            jint real_sdk = -1;
             jfieldID sdk = env->GetStaticFieldID(version, "SDK_INT", "I");
             if (env->ExceptionCheck()) env->ExceptionClear();
-            if (sdk) {
-                jint cur = env->GetStaticIntField(version, sdk);
-                if (cur >= 30) env->SetStaticIntField(version, sdk, 29);
-            }
-            jfieldID res_sdk = env->GetStaticFieldID(version, "RESOURCES_SDK_INT", "I");
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            if (res_sdk) {
-                jint cur = env->GetStaticIntField(version, res_sdk);
-                if (cur >= 30) env->SetStaticIntField(version, res_sdk, 29);
+            if (sdk) real_sdk = env->GetStaticIntField(version, sdk);
+
+            // Android 16/API 36+ framework and UI code can depend on the real SDK.
+            // Keep the older compatibility spoof only for API 30-35.
+            const bool allow_sdk_spoof = real_sdk >= 30 && real_sdk < 36;
+            if (allow_sdk_spoof) {
+                if (sdk) env->SetStaticIntField(version, sdk, 29);
+
+                jfieldID res_sdk = env->GetStaticFieldID(version, "RESOURCES_SDK_INT", "I");
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (res_sdk) {
+                    jint cur = env->GetStaticIntField(version, res_sdk);
+                    if (cur >= 30) env->SetStaticIntField(version, res_sdk, 29);
+                }
+                LOGI("[%s] Build.VERSION SDK spoof installed (sdk=%d)", g_app_name, real_sdk);
+            } else {
+                LOGI("[%s] Build.VERSION SDK spoof skipped (sdk=%d)", g_app_name, real_sdk);
             }
             env->DeleteLocalRef(version);
-            LOGI("[%s] Build.VERSION SDK spoof installed", g_app_name);
         }
     }
 
@@ -1898,6 +1924,7 @@ static void install_jni_hooks(JNIEnv *env) {
         "com/eltavine/duckdetector/features/nativeroot/data/native/NativeRootNativeBridge",
         native_root_bridge, 1);
     LOGI("[%s] Duck native bridge hooks requested", g_app_name);
+    g_jni_installed = true;
     pthread_mutex_unlock(&g_jni_lock);
 }
 
@@ -1957,8 +1984,14 @@ public:
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
         if (!target) return;
         install_jni_hooks(env);
-        int hooked = register_plt_hooks();
-        start_delayed_hooks();
+        int hooked = 0;
+        int sdk = get_runtime_sdk(env);
+        if (sdk >= 36) {
+            LOGI("[%s] native PLT hooks skipped on sdk=%d", g_app_name, sdk);
+        } else {
+            hooked = register_plt_hooks();
+            start_delayed_hooks();
+        }
         LOGI("[%s] %s active, plt_libs=%d", g_app_name, MODULE_VERSION, hooked);
     }
 
@@ -1980,14 +2013,35 @@ private:
         return hit;
     }
 
+    static bool jstr_eq(JNIEnv *e, jstring s, const char *value) {
+        if (!e || !s || !value) return false;
+        const char *c = e->GetStringUTFChars(s, nullptr);
+        if (!c) return false;
+        bool hit = strcmp(c, value) == 0;
+        e->ReleaseStringUTFChars(s, c);
+        return hit;
+    }
+
     bool should_install(JNIEnv *e, zygisk::AppSpecializeArgs *args) {
         if (!e || !args) return false;
-        if (jstr_has(e, args->nice_name, "com.eltavine.duckdetector") ||
-            jstr_has(e, args->nice_name, "duckdetector") ||
-            jstr_has(e, args->app_data_dir, "com.eltavine.duckdetector") ||
-            jstr_has(e, args->app_data_dir, "duckdetector")) {
+
+        const bool is_child_zygote =
+            (args->is_child_zygote && *args->is_child_zygote) ||
+            jstr_has(e, args->nice_name, "_zygote");
+        if (is_child_zygote) {
+            LOGI("[duckdetector] skip child zygote process");
+            return false;
+        }
+
+        if (jstr_eq(e, args->nice_name, "com.eltavine.duckdetector") ||
+            jstr_has(e, args->nice_name, "com.eltavine.duckdetector:zygisk_fd_detector")) {
             snprintf(g_app_name, sizeof(g_app_name), "duckdetector");
             return true;
+        }
+
+        if (jstr_has(e, args->nice_name, "com.eltavine.duckdetector") ||
+            jstr_has(e, args->app_data_dir, "com.eltavine.duckdetector")) {
+            LOGI("[duckdetector] skip helper process outside allowlist");
         }
         return false;
     }

@@ -14,7 +14,7 @@ if (-not $Output) {
     $Output = "anti_dev_pm_zygisk-$version.zip"
 }
 
-$outPath = Join-Path (Split-Path $projectRoot -Parent) $Output
+$outPath = Join-Path $projectRoot $Output
 $zygiskDir = Join-Path $moduleDir "zygisk"
 New-Item -ItemType Directory -Force -Path $zygiskDir | Out-Null
 
