@@ -1,7 +1,7 @@
 id=anti_dev_pm_zygisk
 name=Anti-Dev-Adb-pm
-version=v2.4.3
-versionCode=20403
+version=v2.5.3
+versionCode=20503
 author=geekbyte
-description=DuckDetector-scoped Zygisk observation bypass: sanitizes Binder/PackageManager/Settings, Duck native root/SU snapshots, getprop, property area, memory maps, and risky-app/manager probes. No pm hide, no appops, no ADB disable.
+description=DuckDetector-scoped visibility module: sanitizes SystemProperties, Binder PackageManager/Settings requests, Duck native root/SU/memory/property snapshots, risky-app probes, and grants MIUI/HyperOS inventory visibility to DuckDetector. No pm hide, no ADB disable.
 updateJson=

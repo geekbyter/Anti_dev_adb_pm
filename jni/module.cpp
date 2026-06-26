@@ -1,4 +1,4 @@
-// anti_dev_pm_zygisk v2.4.3
+// anti_dev_pm_zygisk v2.5.3
 // DuckDetector-scoped observation bypass:
 //   - Does not hide, disable, stop, or uninstall any real package/service.
 //   - Spoofs Duck-visible ADB/developer system properties.
@@ -26,7 +26,7 @@
 
 #include "zygisk.hpp"
 
-#define MODULE_VERSION "v2.4.3"
+#define MODULE_VERSION "v2.5.3"
 #define LOG_TAG "DuckVisBypass"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -61,8 +61,9 @@ static zygisk::Api *g_api = nullptr;
 static JavaVM *g_vm = nullptr;
 static pthread_mutex_t g_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_jni_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool g_hooks_started = false;
-static bool g_jni_installed = false;
+static pthread_mutex_t g_bridge_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_core_jni_installed = false;
+static bool g_retry_started = false;
 static char g_app_name[128] = "?";
 
 // ---------------------------------------------------------------------------
@@ -75,76 +76,39 @@ struct PropSpoof {
 };
 
 static const PropSpoof kPropSpoofs[] = {
-    { "persist.sys.usb.config",      "mtp" },
-    { "sys.usb.config",              "mtp" },
-    { "sys.usb.state",               "mtp" },
+    // ADB daemon state
     { "init.svc.adbd",               "stopped" },
     { "init.svc.adbd_root",          "stopped" },
     { "service.adb.root",            "0" },
     { "persist.service.adb.enable",  "0" },
     { "persist.adb.tcp.port",        "-1" },
     { "service.adb.tcp.port",        "-1" },
+    // Developer settings
+    { "persist.sys.development_settings_enabled", "0" },
+    { "ro.allow.mock.location",      "0" },
+    // Debuggable (commonly checked alongside ADB)
     { "ro.debuggable",               "0" },
     { "ro.secure",                   "1" },
     { "ro.adb.secure",               "1" },
-    { "ro.allow.mock.location",      "0" },
-    { "persist.sys.development_settings_enabled", "0" },
-    { "ro.boot.selinux",             "enforcing" },
-    { "ro.build.selinux",            "1" },
-    { "ro.boot.verifiedbootstate",   "green" },
-    { "ro.boot.flash.locked",        "1" },
-    { "ro.boot.veritymode",          "enforcing" },
-    { "ro.boot.vbmeta.device_state", "locked" },
-    { "ro.boot.vbmeta.hash_alg",     "sha256" },
-    { "ro.boot.vbmeta.invalidate_on_error", "yes" },
-    { "partition.system.verified",   "1" },
-    { "partition.vendor.verified",   "1" },
-    { "partition.product.verified",  "1" },
-    { "partition.system_ext.verified", "1" },
-    { "partition.odm.verified",      "1" },
-    { "ro.build.type",               "user" },
-    { "ro.build.tags",               "release-keys" },
-    { "ro.crypto.state",             "encrypted" },
-    { "sys.oem_unlock_allowed",      "0" },
-    { "ro.oem_unlock_supported",     "0" },
-    { "init.svc.magisk_daemon",      "stopped" },
-    { "init.svc.magisk_service",     "stopped" },
-    { "ro.magisk.hide",              "0" },
-    { "ro.boot.warranty_bit",        "0" },
-    { "ro.warranty_bit",             "0" },
-    { "ro.boot.knox.state",          "NORMAL" },
-    { "ro.modversion",               "" },
-    { "ro.cm.version",               "" },
-    { "ro.lineage.version",          "" },
-    { "ro.resurrection.version",     "" },
-    { "ro.pa.version",               "" },
-    { "ro.crdroid.version",          "" },
-    { "ro.pixelexperience.version",  "" },
-    { "ro.evolution.version",        "" },
-    { "ro.havoc.version",            "" },
-    { "persist.sys.spoof.gms",       "" },
-    { "persist.sys.pihooks.disable.gms", "" },
-    { "persist.sys.pihooks_ID",      "" },
-    { "persist.sys.pihooks_DEVICE_INIT", "" },
-    { "persist.sys.pixelprops.pi",   "" },
-    { "persist.sys.pixelprops.gms",  "" },
-    { "persist.sys.pixelprops.gapps", "" },
-    { "persist.sys.pixelprops.google", "" },
-    { "persist.sys.pihooks_BRAND",   "" },
-    { "persist.sys.pihooks_MODEL",   "" },
-    { "persist.sys.pihooks_DEVICE",  "" },
-    { "persist.sys.pihooks_PRODUCT", "" },
-    { "persist.sys.pihooks_MANUFACTURE", "" },
-    { "persist.sys.pihooks_MANUFACTURER", "" },
-    { "persist.sys.pihooks_RELEASE", "" },
-    { "persist.sys.pihooks_SDK_INT", "" },
-    { "persist.sys.pihooks_FINGERPRINT", "" },
-    { "persist.sys.pihooks_SECURITY_PA", "" },
-    { "persist.sys.pihooks_SECURITY_PATCH", "" },
     { nullptr, nullptr },
 };
 
-static const char *spoof_prop(const char *name) {
+static const char * const kUsbConfigProps[] = {
+    "persist.sys.usb.config",
+    "sys.usb.config",
+    "sys.usb.state",
+    nullptr,
+};
+
+static bool is_usb_config_prop(const char *name) {
+    if (!name || !*name) return false;
+    for (const char * const *p = kUsbConfigProps; *p; ++p) {
+        if (strcmp(name, *p) == 0) return true;
+    }
+    return false;
+}
+
+static const char *static_spoof_prop(const char *name) {
     if (!name || !*name) return nullptr;
     for (const PropSpoof *p = kPropSpoofs; p->name; ++p) {
         if (strcmp(name, p->name) == 0) return p->value;
@@ -152,13 +116,8 @@ static const char *spoof_prop(const char *name) {
     return nullptr;
 }
 
-static const char *spoof_prop(JNIEnv *env, jstring key) {
-    if (!env || !key) return nullptr;
-    const char *s = env->GetStringUTFChars(key, nullptr);
-    if (!s) return nullptr;
-    const char *r = spoof_prop(s);
-    env->ReleaseStringUTFChars(key, s);
-    return r;
+static bool prop_needs_spoof(const char *name) {
+    return is_usb_config_prop(name) || static_spoof_prop(name) != nullptr;
 }
 
 static int copy_prop(char *dst, const char *val) {
@@ -168,6 +127,67 @@ static int copy_prop(char *dst, const char *val) {
     memcpy(dst, val, n);
     dst[n] = '\0';
     return (int)n;
+}
+
+static int read_real_system_property(const char *name, char *value) {
+    if (!name || !value) return 0;
+    value[0] = '\0';
+    using prop_get_fn = int (*)(const char *, char *);
+    static prop_get_fn real_get = nullptr;
+    if (!real_get) {
+        real_get = (prop_get_fn)dlsym(RTLD_DEFAULT, "__system_property_get");
+    }
+    return real_get ? real_get(name, value) : 0;
+}
+
+static bool token_is_adb(const char *s, size_t len) {
+    if (len != 3) return false;
+    char a = (s[0] >= 'A' && s[0] <= 'Z') ? (char)(s[0] + 32) : s[0];
+    char d = (s[1] >= 'A' && s[1] <= 'Z') ? (char)(s[1] + 32) : s[1];
+    char b = (s[2] >= 'A' && s[2] <= 'Z') ? (char)(s[2] + 32) : s[2];
+    return a == 'a' && d == 'd' && b == 'b';
+}
+
+static void sanitize_usb_config_value(const char *real, char *out,
+                                      size_t out_max) {
+    if (!out || out_max == 0) return;
+    out[0] = '\0';
+    const char *src = (real && *real) ? real : "mtp";
+    size_t pos = 0;
+    const char *p = src;
+    while (*p) {
+        while (*p == ',' || *p == ' ') ++p;
+        const char *start = p;
+        while (*p && *p != ',') ++p;
+        const char *end = p;
+        while (end > start && end[-1] == ' ') --end;
+        size_t len = (size_t)(end - start);
+        if (len && !token_is_adb(start, len)) {
+            if (pos && pos + 1 < out_max) out[pos++] = ',';
+            for (size_t i = 0; i < len && pos + 1 < out_max; ++i) {
+                out[pos++] = start[i];
+            }
+        }
+        if (*p == ',') ++p;
+    }
+    if (pos == 0) {
+        copy_prop(out, "mtp");
+    } else {
+        out[pos] = '\0';
+    }
+}
+
+static bool make_spoof_prop_value(const char *name, const char *real_value,
+                                  char *out, size_t out_max) {
+    if (!name || !out || out_max == 0) return false;
+    if (is_usb_config_prop(name)) {
+        sanitize_usb_config_value(real_value, out, out_max);
+        return true;
+    }
+    const char *s = static_spoof_prop(name);
+    if (!s) return false;
+    copy_prop(out, s);
+    return true;
 }
 
 static long prop_to_long(const char *v, long def) {
@@ -206,43 +226,53 @@ static void (*o_sys_prop_read_callback)(
     const prop_info *,
     void (*)(void *, const char *, const char *, uint32_t),
     void *) = nullptr;
-static int (*o_sys_prop_foreach)(void (*)(const prop_info *, void *),
-                                 void *) = nullptr;
 
 static int h_sys_prop_get(const char *name, char *value) {
-    const char *s = spoof_prop(name);
-    if (s) return copy_prop(value, s);
     if (!o_sys_prop_get) {
         if (value) value[0] = '\0';
         errno = ENOSYS;
         return 0;
     }
-    return o_sys_prop_get(name, value);
+    char real[PROP_VALUE_MAX] = {};
+    int rc = o_sys_prop_get(name, real);
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_spoof_prop_value(name, real, spoofed, sizeof(spoofed))) {
+        return copy_prop(value, spoofed);
+    }
+    if (value) copy_prop(value, real);
+    return rc;
 }
 
 static const prop_info *h_sys_prop_find(const char *name) {
-    if (spoof_prop(name)) {
-        errno = ENOENT;
-        return nullptr;
-    }
     return o_sys_prop_find ? o_sys_prop_find(name) : nullptr;
 }
 
 static int h_prop_get(const char *name, char *value, const char *def) {
-    const char *s = spoof_prop(name);
-    if (s) return copy_prop(value, s);
     if (!o_prop_get) {
+        char spoofed[PROP_VALUE_MAX] = {};
+        if (make_spoof_prop_value(name, def, spoofed, sizeof(spoofed))) {
+            return copy_prop(value, spoofed);
+        }
         if (def) return copy_prop(value, def);
         if (value) value[0] = '\0';
         return 0;
     }
-    return o_prop_get(name, value, def);
+    char real[PROP_VALUE_MAX] = {};
+    int rc = o_prop_get(name, real, def);
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_spoof_prop_value(name, real, spoofed, sizeof(spoofed))) {
+        return copy_prop(value, spoofed);
+    }
+    if (value) copy_prop(value, real);
+    return rc;
 }
 
 static int h_sys_prop_read(const prop_info *pi, char *name, char *value) {
     int rc = o_sys_prop_read ? o_sys_prop_read(pi, name, value) : 0;
-    const char *s = spoof_prop(name);
-    if (s) return copy_prop(value, s);
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_spoof_prop_value(name, value, spoofed, sizeof(spoofed))) {
+        return copy_prop(value, spoofed);
+    }
     return rc;
 }
 
@@ -255,8 +285,12 @@ static void prop_read_cb_bridge(void *data, const char *name, const char *value,
                                 uint32_t serial) {
     PropReadCbCookie *ctx = (PropReadCbCookie *)data;
     if (!ctx || !ctx->cb) return;
-    const char *s = spoof_prop(name);
-    ctx->cb(ctx->cookie, name, s ? s : value, serial);
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_spoof_prop_value(name, value, spoofed, sizeof(spoofed))) {
+        ctx->cb(ctx->cookie, name, spoofed, serial);
+    } else {
+        ctx->cb(ctx->cookie, name, value, serial);
+    }
 }
 
 static void h_sys_prop_read_callback(
@@ -268,73 +302,205 @@ static void h_sys_prop_read_callback(
     o_sys_prop_read_callback(pi, prop_read_cb_bridge, &ctx);
 }
 
-struct PropForeachCtx {
-    void (*cb)(const prop_info *, void *);
-    void *cookie;
-};
-
-static void prop_foreach_bridge(const prop_info *pi, void *data) {
-    PropForeachCtx *ctx = (PropForeachCtx *)data;
-    if (!ctx || !ctx->cb || !pi) return;
-    char name[PROP_NAME_MAX] = {};
-    char value[PROP_VALUE_MAX] = {};
-    if (o_sys_prop_read && o_sys_prop_read(pi, name, value) >= 0 &&
-        spoof_prop(name)) {
-        return;
-    }
-    ctx->cb(pi, ctx->cookie);
-}
-
-static int h_sys_prop_foreach(void (*cb)(const prop_info *, void *),
-                              void *cookie) {
-    if (!o_sys_prop_foreach || !cb) {
-        errno = ENOSYS;
-        return -1;
-    }
-    PropForeachCtx ctx{cb, cookie};
-    return o_sys_prop_foreach(prop_foreach_bridge, &ctx);
-}
-
 static jstring (*o_sp_get1)(JNIEnv *, jclass, jstring) = nullptr;
 static jstring (*o_sp_get2)(JNIEnv *, jclass, jstring, jstring) = nullptr;
 static jint (*o_sp_geti)(JNIEnv *, jclass, jstring, jint) = nullptr;
 static jlong (*o_sp_getl)(JNIEnv *, jclass, jstring, jlong) = nullptr;
 static jboolean (*o_sp_getb)(JNIEnv *, jclass, jstring, jboolean) = nullptr;
+static jint (*o_unix_fork_exec)(
+    JNIEnv *, jobject, jbyteArray, jbyteArray, jint, jbyteArray, jint,
+    jbyteArray, jintArray, jboolean) = nullptr;
+static jint (*o_process_fork_exec)(
+    JNIEnv *, jobject, jint, jbyteArray, jbyteArray, jbyteArray, jint,
+    jbyteArray, jint, jbyteArray, jintArray, jboolean) = nullptr;
+
+static bool make_java_prop_value(JNIEnv *env, jclass cls, jstring key,
+                                 jstring def, char *out, size_t out_max) {
+    if (!env || !key || !out || out_max == 0) return false;
+    const char *name = env->GetStringUTFChars(key, nullptr);
+    if (!name) return false;
+    bool needs = prop_needs_spoof(name);
+    if (!needs) {
+        env->ReleaseStringUTFChars(key, name);
+        return false;
+    }
+
+    char real[PROP_VALUE_MAX] = {};
+    if (is_usb_config_prop(name)) {
+        jstring real_j = nullptr;
+        if (o_sp_get2) {
+            real_j = o_sp_get2(env, cls, key, def);
+        } else if (o_sp_get1) {
+            real_j = o_sp_get1(env, cls, key);
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            real_j = nullptr;
+        }
+        if (real_j) {
+            const char *rs = env->GetStringUTFChars(real_j, nullptr);
+            if (rs) {
+                copy_prop(real, rs);
+                env->ReleaseStringUTFChars(real_j, rs);
+            }
+            env->DeleteLocalRef(real_j);
+        } else if (def) {
+            const char *ds = env->GetStringUTFChars(def, nullptr);
+            if (ds) {
+                copy_prop(real, ds);
+                env->ReleaseStringUTFChars(def, ds);
+            }
+        }
+    }
+
+    bool ok = make_spoof_prop_value(name, real, out, out_max);
+    env->ReleaseStringUTFChars(key, name);
+    return ok;
+}
 
 static jstring h_sp_get1(JNIEnv *env, jclass cls, jstring key) {
-    (void)cls;
-    const char *s = spoof_prop(env, key);
-    if (s) return env->NewStringUTF(s);
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_java_prop_value(env, cls, key, nullptr, spoofed, sizeof(spoofed))) {
+        return env->NewStringUTF(spoofed);
+    }
     return o_sp_get1 ? o_sp_get1(env, cls, key) : env->NewStringUTF("");
 }
 
 static jstring h_sp_get2(JNIEnv *env, jclass cls, jstring key, jstring def) {
-    (void)cls;
-    const char *s = spoof_prop(env, key);
-    if (s) return env->NewStringUTF(s);
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_java_prop_value(env, cls, key, def, spoofed, sizeof(spoofed))) {
+        return env->NewStringUTF(spoofed);
+    }
     if (o_sp_get2) return o_sp_get2(env, cls, key, def);
     return def ? (jstring)env->NewLocalRef(def) : env->NewStringUTF("");
 }
 
 static jint h_sp_geti(JNIEnv *env, jclass cls, jstring key, jint def) {
     (void)cls;
-    const char *s = spoof_prop(env, key);
-    if (s) return (jint)prop_to_long(s, def);
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_java_prop_value(env, cls, key, nullptr, spoofed, sizeof(spoofed))) {
+        return (jint)prop_to_long(spoofed, def);
+    }
     return o_sp_geti ? o_sp_geti(env, cls, key, def) : def;
 }
 
 static jlong h_sp_getl(JNIEnv *env, jclass cls, jstring key, jlong def) {
     (void)cls;
-    const char *s = spoof_prop(env, key);
-    if (s) return (jlong)prop_to_long(s, (long)def);
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_java_prop_value(env, cls, key, nullptr, spoofed, sizeof(spoofed))) {
+        return (jlong)prop_to_long(spoofed, (long)def);
+    }
     return o_sp_getl ? o_sp_getl(env, cls, key, def) : def;
 }
 
 static jboolean h_sp_getb(JNIEnv *env, jclass cls, jstring key, jboolean def) {
     (void)cls;
-    const char *s = spoof_prop(env, key);
-    if (s) return prop_to_bool(s, def == JNI_TRUE) ? JNI_TRUE : JNI_FALSE;
+    char spoofed[PROP_VALUE_MAX] = {};
+    if (make_java_prop_value(env, cls, key, nullptr, spoofed, sizeof(spoofed))) {
+        return prop_to_bool(spoofed, def == JNI_TRUE) ? JNI_TRUE : JNI_FALSE;
+    }
     return o_sp_getb ? o_sp_getb(env, cls, key, def) : def;
+}
+
+static bool byte_array_mentions_getprop(JNIEnv *env, jbyteArray arr) {
+    if (!env || !arr) return false;
+    jsize len = env->GetArrayLength(arr);
+    if (len <= 0 || len > 4096) return false;
+    char buf[4097];
+    jsize n = len < 4096 ? len : 4096;
+    env->GetByteArrayRegion(arr, 0, n, (jbyte *)buf);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    buf[n] = '\0';
+    return strstr(buf, "getprop") != nullptr;
+}
+
+static jbyteArray new_bytes(JNIEnv *env, const char *data, size_t len) {
+    if (!env || !data) return nullptr;
+    jbyteArray arr = env->NewByteArray((jsize)len);
+    if (!arr) return nullptr;
+    env->SetByteArrayRegion(arr, 0, (jsize)len, (const jbyte *)data);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(arr);
+        return nullptr;
+    }
+    return arr;
+}
+
+static jbyteArray new_c_string_bytes(JNIEnv *env, const char *s) {
+    return new_bytes(env, s, strlen(s) + 1);
+}
+
+static jbyteArray new_sh_arg_block(JNIEnv *env) {
+    static const char kArg0[] = "-c";
+    static const char kCmd[] =
+        "getprop | grep -v -E 'persist\\.sys\\.usb\\.config|sys\\.usb\\.config|"
+        "sys\\.usb\\.state|init\\.svc\\.adbd|init\\.svc\\.adbd_root|"
+        "service\\.adb\\.root|persist\\.service\\.adb\\.enable|"
+        "persist\\.adb\\.tcp\\.port|service\\.adb\\.tcp\\.port|"
+        "persist\\.sys\\.development_settings_enabled|ro\\.debuggable|"
+        "ro\\.secure|ro\\.adb\\.secure'";
+    const size_t len0 = sizeof(kArg0);
+    const size_t len1 = sizeof(kCmd);
+    char block[sizeof(kArg0) + sizeof(kCmd)];
+    memcpy(block, kArg0, len0);
+    memcpy(block + len0, kCmd, len1);
+    return new_bytes(env, block, len0 + len1);
+}
+
+static jint h_unix_fork_exec(JNIEnv *env, jobject thiz, jbyteArray prog,
+                             jbyteArray arg_block, jint argc,
+                             jbyteArray env_block, jint envc,
+                             jbyteArray dir, jintArray fds,
+                             jboolean redirect_error_stream) {
+    if (o_unix_fork_exec && byte_array_mentions_getprop(env, prog)) {
+        jbyteArray sh = new_c_string_bytes(env, "/system/bin/sh");
+        jbyteArray args = new_sh_arg_block(env);
+        if (sh && args) {
+            LOGD("[%s] redirected UNIXProcess getprop", g_app_name);
+            jint rc = o_unix_fork_exec(env, thiz, sh, args, 2, env_block, envc,
+                                       dir, fds, redirect_error_stream);
+            env->DeleteLocalRef(sh);
+            env->DeleteLocalRef(args);
+            return rc;
+        }
+        if (sh) env->DeleteLocalRef(sh);
+        if (args) env->DeleteLocalRef(args);
+    }
+    return o_unix_fork_exec ?
+        o_unix_fork_exec(env, thiz, prog, arg_block, argc, env_block, envc,
+                         dir, fds, redirect_error_stream) :
+        -1;
+}
+
+static jint h_process_fork_exec(JNIEnv *env, jobject thiz, jint mode,
+                                jbyteArray helper, jbyteArray prog,
+                                jbyteArray arg_block, jint argc,
+                                jbyteArray env_block, jint envc,
+                                jbyteArray dir, jintArray fds,
+                                jboolean redirect_error_stream) {
+    if (o_process_fork_exec && byte_array_mentions_getprop(env, prog)) {
+        jbyteArray sh = new_c_string_bytes(env, "/system/bin/sh");
+        jbyteArray args = new_sh_arg_block(env);
+        if (sh && args) {
+            LOGD("[%s] redirected ProcessImpl getprop", g_app_name);
+            jint rc = o_process_fork_exec(env, thiz, mode, helper, sh, args, 2,
+                                          env_block, envc, dir, fds,
+                                          redirect_error_stream);
+            env->DeleteLocalRef(sh);
+            env->DeleteLocalRef(args);
+            return rc;
+        }
+        if (sh) env->DeleteLocalRef(sh);
+        if (args) env->DeleteLocalRef(args);
+    }
+    return o_process_fork_exec ?
+        o_process_fork_exec(env, thiz, mode, helper, prog, arg_block, argc,
+                            env_block, envc, dir, fds, redirect_error_stream) :
+        -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -877,6 +1043,7 @@ static jboolean h_binder_transact(JNIEnv *env, jobject thiz, jint code,
     bool relevant = false;
     bool settings_request = false;
     bool direct_hidden_pkg = false;
+    bool direct_request_rewritten = false;
     jbyteArray data_arr = nullptr;
     jsize data_len = 0;
     jbyte *data_bytes = parcel_to_bytes(env, data, &data_len, &data_arr);
@@ -887,6 +1054,21 @@ static jboolean h_binder_transact(JNIEnv *env, jobject thiz, jint code,
             (const unsigned char *)data_bytes, (size_t)data_len);
         direct_hidden_pkg = request_is_direct_pm_hidden_package(
             (const unsigned char *)data_bytes, (size_t)data_len);
+        if (direct_hidden_pkg) {
+            unsigned char *copy = (unsigned char *)malloc((size_t)data_len);
+            if (copy) {
+                memcpy(copy, data_bytes, (size_t)data_len);
+                if (sanitize_parcel_bytes(copy, (size_t)data_len, false)) {
+                    direct_request_rewritten =
+                        write_bytes_to_parcel(env, data, copy, data_len);
+                    if (direct_request_rewritten) {
+                        LOGD("[%s] rewrote direct PM request code=%d",
+                             g_app_name, (int)code);
+                    }
+                }
+                free(copy);
+            }
+        }
     }
     parcel_release_bytes(env, data_arr, data_bytes);
 
@@ -909,7 +1091,7 @@ static jboolean h_binder_transact(JNIEnv *env, jobject thiz, jint code,
         if (copy) {
             memcpy(copy, reply_bytes, (size_t)reply_len);
             bool changed = false;
-            if (direct_hidden_pkg) {
+            if (direct_hidden_pkg && !direct_request_rewritten) {
                 changed |= null_direct_pm_reply(copy, (size_t)reply_len);
             }
             changed |= sanitize_parcel_bytes(copy, (size_t)reply_len,
@@ -929,17 +1111,60 @@ static jboolean h_binder_transact(JNIEnv *env, jobject thiz, jint code,
 // DuckDetector native bridge overrides
 // ---------------------------------------------------------------------------
 
+static void append_text(char *out, size_t out_max, size_t *pos,
+                        const char *text) {
+    if (!out || !pos || !text || *pos >= out_max) return;
+    size_t remaining = out_max - *pos;
+    int n = snprintf(out + *pos, remaining, "%s", text);
+    if (n > 0) {
+        size_t used = (size_t)n;
+        *pos += used < remaining ? used : remaining - 1;
+    }
+}
+
+static void append_prop_line(JNIEnv *env, jobjectArray keys, jsize i,
+                             char *out, size_t out_max, size_t *pos) {
+    jstring key = (jstring)env->GetObjectArrayElement(keys, i);
+    if (!key) return;
+    const char *name = env->GetStringUTFChars(key, nullptr);
+    if (!name) {
+        env->DeleteLocalRef(key);
+        return;
+    }
+    char real[PROP_VALUE_MAX] = {};
+    char value[PROP_VALUE_MAX] = {};
+    (void)read_real_system_property(name, real);
+    if (!make_spoof_prop_value(name, real, value, sizeof(value))) {
+        copy_prop(value, real);
+    }
+
+    char line[PROP_NAME_MAX + PROP_VALUE_MAX + 16];
+    snprintf(line, sizeof(line), "PROP=%s|%s\n", name, value);
+    append_text(out, out_max, pos, line);
+    env->ReleaseStringUTFChars(key, name);
+    env->DeleteLocalRef(key);
+}
+
 static jstring h_duck_props_snapshot(JNIEnv *env, jobject thiz,
                                      jobjectArray keys) {
     (void)thiz;
-    (void)keys;
-    return env->NewStringUTF(
+    char out[8192];
+    size_t pos = 0;
+    out[0] = '\0';
+    append_text(out, sizeof(out), &pos,
         "AVAILABLE=1\n"
         "PROP_AREA_AVAILABLE=1\n"
         "PROP_AREA_CONTEXTS=0\n"
         "PROP_AREA_HOLES=0\n"
         "RO_HANDLE_AVAILABLE=1\n"
-        "RO_HANDLE_CHECKED=0\n");
+        "RO_HANDLE_CHECKED=1\n");
+    if (env && keys) {
+        jsize count = env->GetArrayLength(keys);
+        for (jsize i = 0; i < count && pos + 64 < sizeof(out); ++i) {
+            append_prop_line(env, keys, i, out, sizeof(out), &pos);
+        }
+    }
+    return env->NewStringUTF(out);
 }
 
 static jstring h_duck_pif_snapshot(JNIEnv *env, jobject thiz,
@@ -1083,57 +1308,214 @@ static jstring h_duck_native_root_snapshot(JNIEnv *env, jobject thiz,
         "PROPERTY_CHECKS=0\n");
 }
 
-static void hook_duck_native_methods(JNIEnv *env, const char *class_name,
-                                     JNINativeMethod *methods, int count) {
-    if (!g_api || !env || !class_name || !methods || count <= 0) return;
-    g_api->hookJniNativeMethods(env, class_name, methods, count);
+static bool g_bridge_props = false;
+static bool g_bridge_pif = false;
+static bool g_bridge_dangerous = false;
+static bool g_bridge_memory = false;
+static bool g_bridge_lsposed = false;
+static bool g_bridge_zygisk = false;
+static bool g_bridge_su = false;
+static bool g_bridge_cgroup = false;
+static bool g_bridge_native_root = false;
+
+static jclass load_app_class(JNIEnv *env, const char *dot_name) {
+    if (!env || !dot_name) return nullptr;
+    jclass at_cls = env->FindClass("android/app/ActivityThread");
+    if (!at_cls) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    jmethodID current_app = env->GetStaticMethodID(
+        at_cls, "currentApplication", "()Landroid/app/Application;");
     if (env->ExceptionCheck()) env->ExceptionClear();
+    if (!current_app) {
+        env->DeleteLocalRef(at_cls);
+        return nullptr;
+    }
+    jobject app = env->CallStaticObjectMethod(at_cls, current_app);
+    env->DeleteLocalRef(at_cls);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (!app) return nullptr;
+
+    jclass app_cls = env->GetObjectClass(app);
+    jmethodID get_loader = app_cls ?
+        env->GetMethodID(app_cls, "getClassLoader", "()Ljava/lang/ClassLoader;") :
+        nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jobject loader = get_loader ? env->CallObjectMethod(app, get_loader) : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (app_cls) env->DeleteLocalRef(app_cls);
+    env->DeleteLocalRef(app);
+    if (!loader) return nullptr;
+
+    jclass loader_cls = env->FindClass("java/lang/ClassLoader");
+    if (!loader_cls) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(loader);
+        return nullptr;
+    }
+    jmethodID load_class = env->GetMethodID(
+        loader_cls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(loader_cls);
+    if (!load_class) {
+        env->DeleteLocalRef(loader);
+        return nullptr;
+    }
+
+    jstring name = env->NewStringUTF(dot_name);
+    jobject clazz = name ? env->CallObjectMethod(loader, load_class, name) : nullptr;
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        clazz = nullptr;
+    }
+    if (name) env->DeleteLocalRef(name);
+    env->DeleteLocalRef(loader);
+    return (jclass)clazz;
 }
 
-static int register_plt_hooks();
+static bool register_app_native_method(JNIEnv *env, const char *dot_name,
+                                       const char *method_name,
+                                       const char *signature, void *hook) {
+    if (!env || !dot_name || !method_name || !signature || !hook) {
+        return false;
+    }
+    jclass cls = load_app_class(env, dot_name);
+    if (!cls) return false;
+    JNINativeMethod method = { method_name, signature, hook };
+    bool ok = env->RegisterNatives(cls, &method, 1) == JNI_OK;
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        ok = false;
+    }
+    env->DeleteLocalRef(cls);
+    return ok;
+}
+
+static bool hook_bridge_method(JNIEnv *env, const char *dot_name,
+                               const char *jadx_dot_name,
+                               const char *method_name,
+                               const char *signature, void *hook) {
+    if (register_app_native_method(env, dot_name, method_name, signature, hook)) {
+        return true;
+    }
+    return jadx_dot_name &&
+           register_app_native_method(env, jadx_dot_name, method_name,
+                                      signature, hook);
+}
+
+static int install_duck_bridge_hooks(JNIEnv *env) {
+    if (!g_api || !env) return 0;
+    pthread_mutex_lock(&g_bridge_lock);
+    int newly = 0;
+
+    if (!g_bridge_props &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.systemproperties.data.native.SystemPropertiesNativeBridge",
+            "com.eltavine.duckdetector.features.systemproperties.data.p013native.SystemPropertiesNativeBridge",
+            "nativeCollectSnapshot", "([Ljava/lang/String;)Ljava/lang/String;",
+            (void *)h_duck_props_snapshot)) {
+        g_bridge_props = true;
+        ++newly;
+    }
+
+    if (!g_bridge_pif &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.playintegrityfix.data.native.PlayIntegrityFixNativeBridge",
+            "com.eltavine.duckdetector.features.playintegrityfix.data.p010native.PlayIntegrityFixNativeBridge",
+            "nativeCollectSnapshot", "([Ljava/lang/String;)Ljava/lang/String;",
+            (void *)h_duck_pif_snapshot)) {
+        g_bridge_pif = true;
+        ++newly;
+    }
+
+    if (!g_bridge_dangerous &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.dangerousapps.data.native.DangerousAppsNativeBridge",
+            "com.eltavine.duckdetector.features.dangerousapps.data.p004native.DangerousAppsNativeBridge",
+            "nativeStatPackages", "([Ljava/lang/String;)Ljava/lang/String;",
+            (void *)h_duck_dangerous_stat)) {
+        g_bridge_dangerous = true;
+        ++newly;
+    }
+
+    if (!g_bridge_memory &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.memory.data.native.MemoryNativeBridge",
+            "com.eltavine.duckdetector.features.memory.data.p007native.MemoryNativeBridge",
+            "nativeCollectSnapshot", "()Ljava/lang/String;",
+            (void *)h_duck_memory_snapshot)) {
+        g_bridge_memory = true;
+        ++newly;
+    }
+
+    if (!g_bridge_lsposed &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.lsposed.data.native.LSPosedNativeBridge",
+            "com.eltavine.duckdetector.features.lsposed.data.p006native.LSPosedNativeBridge",
+            "nativeCollectSnapshot", "()Ljava/lang/String;",
+            (void *)h_duck_lsposed_snapshot)) {
+        g_bridge_lsposed = true;
+        ++newly;
+    }
+
+    if (!g_bridge_zygisk &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.zygisk.data.native.ZygiskNativeBridge",
+            "com.eltavine.duckdetector.features.zygisk.data.p016native.ZygiskNativeBridge",
+            "nativeCollectSnapshot", "()Ljava/lang/String;",
+            (void *)h_duck_zygisk_snapshot)) {
+        g_bridge_zygisk = true;
+        ++newly;
+    }
+
+    if (!g_bridge_su &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.su.data.native.SuNativeBridge",
+            "com.eltavine.duckdetector.features.p002su.data.p012native.SuNativeBridge",
+            "nativeCollectSnapshot", "()Ljava/lang/String;",
+            (void *)h_duck_su_snapshot)) {
+        g_bridge_su = true;
+        ++newly;
+    }
+
+    if (!g_bridge_cgroup &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.nativeroot.data.native.CgroupProcessLeakNativeBridge",
+            "com.eltavine.duckdetector.features.nativeroot.data.p009native.CgroupProcessLeakNativeBridge",
+            "nativeCollectSnapshot", "()Ljava/lang/String;",
+            (void *)h_duck_cgroup_snapshot)) {
+        g_bridge_cgroup = true;
+        ++newly;
+    }
+
+    if (!g_bridge_native_root &&
+        hook_bridge_method(env,
+            "com.eltavine.duckdetector.features.nativeroot.data.native.NativeRootNativeBridge",
+            "com.eltavine.duckdetector.features.nativeroot.data.p009native.NativeRootNativeBridge",
+            "nativeCollectSnapshot", "(Z)Ljava/lang/String;",
+            (void *)h_duck_native_root_snapshot)) {
+        g_bridge_native_root = true;
+        ++newly;
+    }
+
+    const int total = (g_bridge_props ? 1 : 0) + (g_bridge_pif ? 1 : 0) +
+        (g_bridge_dangerous ? 1 : 0) + (g_bridge_memory ? 1 : 0) +
+        (g_bridge_lsposed ? 1 : 0) + (g_bridge_zygisk ? 1 : 0) +
+        (g_bridge_su ? 1 : 0) + (g_bridge_cgroup ? 1 : 0) +
+        (g_bridge_native_root ? 1 : 0);
+    if (newly > 0 || total < 9) {
+        LOGI("[%s] Duck native bridge hooks ready=%d/9 newly=%d",
+             g_app_name, total, newly);
+    }
+    pthread_mutex_unlock(&g_bridge_lock);
+    return total;
+}
+
+static int __attribute__((unused)) register_plt_hooks();
 static void install_jni_hooks(JNIEnv *env);
 static void install_jni_hooks_from_vm();
 
-static void *duck_jni_symbol_override(const char *name) {
-    if (!name) return nullptr;
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_systemproperties_data_native_SystemPropertiesNativeBridge_nativeCollectSnapshot") == 0) {
-        return (void *)h_duck_props_snapshot;
-    }
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_playintegrityfix_data_native_PlayIntegrityFixNativeBridge_nativeCollectSnapshot") == 0) {
-        return (void *)h_duck_pif_snapshot;
-    }
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_dangerousapps_data_native_DangerousAppsNativeBridge_nativeStatPackages") == 0) {
-        return (void *)h_duck_dangerous_stat;
-    }
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_memory_data_native_MemoryNativeBridge_nativeCollectSnapshot") == 0) {
-        return (void *)h_duck_memory_snapshot;
-    }
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_lsposed_data_native_LSPosedNativeBridge_nativeCollectSnapshot") == 0) {
-        return (void *)h_duck_lsposed_snapshot;
-    }
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_zygisk_data_native_ZygiskNativeBridge_nativeCollectSnapshot") == 0) {
-        return (void *)h_duck_zygisk_snapshot;
-    }
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_su_data_native_SuNativeBridge_nativeCollectSnapshot") == 0) {
-        return (void *)h_duck_su_snapshot;
-    }
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_nativeroot_data_native_CgroupProcessLeakNativeBridge_nativeCollectSnapshot") == 0) {
-        return (void *)h_duck_cgroup_snapshot;
-    }
-    if (strcmp(name,
-        "Java_com_eltavine_duckdetector_features_nativeroot_data_native_NativeRootNativeBridge_nativeCollectSnapshot") == 0) {
-        return (void *)h_duck_native_root_snapshot;
-    }
-    return nullptr;
-}
 
 // ---------------------------------------------------------------------------
 // Native filesystem/process probes
@@ -1160,21 +1542,6 @@ static ssize_t (*o_lgetxattr)(const char *, const char *, void *, size_t) = null
 static DIR *(*o_opendir)(const char *) = nullptr;
 static struct dirent *(*o_readdir)(DIR *) = nullptr;
 static int (*o_closedir)(DIR *) = nullptr;
-static int (*o_execve)(const char *, char *const[], char *const[]) = nullptr;
-static int (*o_execv)(const char *, char *const[]) = nullptr;
-static int (*o_execvp)(const char *, char *const[]) = nullptr;
-static int (*o_posix_spawn)(pid_t *, const char *,
-                            const posix_spawn_file_actions_t *,
-                            const posix_spawnattr_t *,
-                            char *const[], char *const[]) = nullptr;
-static FILE *(*o_popen)(const char *, const char *) = nullptr;
-static char *(*o_getenv)(const char *) = nullptr;
-static char *(*o_secure_getenv)(const char *) = nullptr;
-static int (*o_prctl)(int, unsigned long, unsigned long, unsigned long,
-                      unsigned long) = nullptr;
-static void *(*o_dlsym)(void *, const char *) = nullptr;
-static void *(*o_dlopen)(const char *, int) = nullptr;
-static void *(*o_android_dlopen_ext)(const char *, int, const void *) = nullptr;
 
 enum FdType {
     FD_NONE = 0,
@@ -1503,162 +1870,6 @@ static const char *base_name(const char *path) {
     return slash ? slash + 1 : path;
 }
 
-static bool arg_contains_android_listing(const char *arg) {
-    if (!arg) return false;
-    char norm[2048];
-    normalize_ascii_z(arg, norm, sizeof(norm));
-    return strstr(norm, "/android/data") || strstr(norm, "/android/obb");
-}
-
-static bool streq_ascii(const char *a, const char *b) {
-    return a && b && strcmp(a, b) == 0;
-}
-
-static bool argv_probe_should_fail(const char *file, char *const argv[]) {
-    const char *cmd0 = (argv && argv[0]) ? argv[0] : file;
-    const char *op = base_name(cmd0);
-    int first_path_arg = 1;
-    if ((streq_ascii(op, "toybox") || streq_ascii(op, "toolbox")) &&
-        argv && argv[1]) {
-        op = argv[1];
-        first_path_arg = 2;
-    }
-
-    bool hidden_arg = false;
-    bool android_listing = false;
-    bool mentions_ls = streq_ascii(op, "ls");
-    bool mentions_getprop = streq_ascii(op, "getprop");
-    if (argv) {
-        for (int i = first_path_arg; argv[i]; ++i) {
-            if (path_should_hide(argv[i])) hidden_arg = true;
-            if (arg_contains_android_listing(argv[i])) android_listing = true;
-            char norm[2048];
-            normalize_ascii_z(argv[i], norm, sizeof(norm));
-            if (strstr(norm, "ls")) mentions_ls = true;
-            if (strstr(norm, "getprop")) mentions_getprop = true;
-        }
-    }
-    if (mentions_getprop) return true;
-    if (hidden_arg) return true;
-    return android_listing &&
-           (streq_ascii(op, "ls") ||
-            (mentions_ls && (streq_ascii(op, "sh") ||
-                             streq_ascii(op, "mksh") ||
-                             streq_ascii(op, "toybox") ||
-                             streq_ascii(op, "toolbox"))));
-}
-
-static int h_execve(const char *file, char *const argv[], char *const envp[]) {
-    if (argv_probe_should_fail(file, argv)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return o_execve ? o_execve(file, argv, envp) : -1;
-}
-
-static int h_execv(const char *file, char *const argv[]) {
-    if (argv_probe_should_fail(file, argv)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return o_execv ? o_execv(file, argv) : -1;
-}
-
-static int h_execvp(const char *file, char *const argv[]) {
-    if (argv_probe_should_fail(file, argv)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return o_execvp ? o_execvp(file, argv) : -1;
-}
-
-static int h_posix_spawn(pid_t *pid, const char *path,
-                         const posix_spawn_file_actions_t *actions,
-                         const posix_spawnattr_t *attrs,
-                         char *const argv[], char *const envp[]) {
-    if (argv_probe_should_fail(path, argv)) return ENOENT;
-    return o_posix_spawn ? o_posix_spawn(pid, path, actions, attrs, argv, envp)
-                         : ENOSYS;
-}
-
-static FILE *h_popen(const char *command, const char *mode) {
-    bool block = path_should_hide(command);
-    if (!block && command) {
-        char norm[2048];
-        normalize_ascii_z(command, norm, sizeof(norm));
-        block = strstr(norm, "getprop") ||
-                (strstr(norm, "ls") && (strstr(norm, "/android/data") ||
-                                        strstr(norm, "/android/obb")));
-    }
-    if (block) {
-        errno = ENOENT;
-        return nullptr;
-    }
-    return o_popen ? o_popen(command, mode) : nullptr;
-}
-
-static bool env_name_should_hide(const char *name) {
-    if (!name || !*name) return false;
-    char norm[256];
-    normalize_ascii_z(name, norm, sizeof(norm));
-    return strstr(norm, "kernelsu") ||
-           strstr(norm, "ksu_") ||
-           strcmp(norm, "kernelsu") == 0 ||
-           strcmp(norm, "ksu") == 0;
-}
-
-static char *h_getenv(const char *name) {
-    if (env_name_should_hide(name)) return nullptr;
-    return o_getenv ? o_getenv(name) : nullptr;
-}
-
-static char *h_secure_getenv(const char *name) {
-    if (env_name_should_hide(name)) return nullptr;
-    return o_secure_getenv ? o_secure_getenv(name) : h_getenv(name);
-}
-
-static int h_prctl(int option, unsigned long arg2, unsigned long arg3,
-                   unsigned long arg4, unsigned long arg5) {
-    if ((unsigned int)option == 0xDEADBEEFu) {
-        (void)arg2;
-        (void)arg3;
-        (void)arg4;
-        (void)arg5;
-        errno = EINVAL;
-        return -1;
-    }
-    return o_prctl ? o_prctl(option, arg2, arg3, arg4, arg5) : -1;
-}
-
-static void refresh_after_load(const char *path) {
-    (void)path;
-    (void)register_plt_hooks();
-    install_jni_hooks_from_vm();
-}
-
-static void *h_dlsym(void *handle, const char *symbol) {
-    void *override = duck_jni_symbol_override(symbol);
-    if (override) {
-        LOGI("[%s] dlsym override: %s", g_app_name, symbol);
-        return override;
-    }
-    return o_dlsym ? o_dlsym(handle, symbol) : nullptr;
-}
-
-static void *h_dlopen(const char *filename, int flags) {
-    void *ret = o_dlopen ? o_dlopen(filename, flags) : nullptr;
-    if (ret) refresh_after_load(filename);
-    return ret;
-}
-
-static void *h_android_dlopen_ext(const char *filename, int flags,
-                                  const void *extinfo) {
-    void *ret = o_android_dlopen_ext ?
-        o_android_dlopen_ext(filename, flags, extinfo) : nullptr;
-    if (ret) refresh_after_load(filename);
-    return ret;
-}
-
 // ---------------------------------------------------------------------------
 // PLT hook registration
 // ---------------------------------------------------------------------------
@@ -1696,7 +1907,7 @@ static bool should_hook_lib(const char *path) {
 #define REG_HOOK(sym, hook, orig) \
     g_api->pltHookRegister(st.st_dev, st.st_ino, sym, (void *)(hook), (void **)&(orig))
 
-static int register_plt_hooks() {
+static int __attribute__((unused)) register_plt_hooks() {
     if (!g_api) return 0;
     pthread_mutex_lock(&g_hook_lock);
 
@@ -1729,8 +1940,6 @@ static int register_plt_hooks() {
         REG_HOOK("__system_property_read", h_sys_prop_read, o_sys_prop_read);
         REG_HOOK("__system_property_read_callback", h_sys_prop_read_callback,
                  o_sys_prop_read_callback);
-        REG_HOOK("__system_property_foreach", h_sys_prop_foreach,
-                 o_sys_prop_foreach);
         REG_HOOK("property_get", h_prop_get, o_prop_get);
 
         REG_HOOK("open", h_open, o_open);
@@ -1754,18 +1963,6 @@ static int register_plt_hooks() {
         REG_HOOK("opendir", h_opendir, o_opendir);
         REG_HOOK("readdir", h_readdir, o_readdir);
         REG_HOOK("closedir", h_closedir, o_closedir);
-        REG_HOOK("execve", h_execve, o_execve);
-        REG_HOOK("execv", h_execv, o_execv);
-        REG_HOOK("execvp", h_execvp, o_execvp);
-        REG_HOOK("posix_spawn", h_posix_spawn, o_posix_spawn);
-        REG_HOOK("popen", h_popen, o_popen);
-        REG_HOOK("getenv", h_getenv, o_getenv);
-        REG_HOOK("secure_getenv", h_secure_getenv, o_secure_getenv);
-        REG_HOOK("prctl", h_prctl, o_prctl);
-        REG_HOOK("dlsym", h_dlsym, o_dlsym);
-        REG_HOOK("dlopen", h_dlopen, o_dlopen);
-        REG_HOOK("android_dlopen_ext", h_android_dlopen_ext,
-                 o_android_dlopen_ext);
         ++reg_count;
     }
     fclose(fp);
@@ -1785,38 +1982,14 @@ static int register_plt_hooks() {
 static void install_jni_hooks(JNIEnv *env) {
     if (!g_api || !env) return;
     pthread_mutex_lock(&g_jni_lock);
-    if (g_jni_installed) {
+    if (g_core_jni_installed) {
         pthread_mutex_unlock(&g_jni_lock);
+        (void)install_duck_bridge_hooks(env);
         return;
     }
 
     {
-        jclass version = env->FindClass("android/os/Build$VERSION");
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        if (version) {
-            jint real_sdk = -1;
-            jfieldID sdk = env->GetStaticFieldID(version, "SDK_INT", "I");
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            if (sdk) real_sdk = env->GetStaticIntField(version, sdk);
-
-            // Android 16/API 36+ framework and UI code can depend on the real SDK.
-            // Keep the older compatibility spoof only for API 30-35.
-            const bool allow_sdk_spoof = real_sdk >= 30 && real_sdk < 36;
-            if (allow_sdk_spoof) {
-                if (sdk) env->SetStaticIntField(version, sdk, 29);
-
-                jfieldID res_sdk = env->GetStaticFieldID(version, "RESOURCES_SDK_INT", "I");
-                if (env->ExceptionCheck()) env->ExceptionClear();
-                if (res_sdk) {
-                    jint cur = env->GetStaticIntField(version, res_sdk);
-                    if (cur >= 30) env->SetStaticIntField(version, res_sdk, 29);
-                }
-                LOGI("[%s] Build.VERSION SDK spoof installed (sdk=%d)", g_app_name, real_sdk);
-            } else {
-                LOGI("[%s] Build.VERSION SDK spoof skipped (sdk=%d)", g_app_name, real_sdk);
-            }
-            env->DeleteLocalRef(version);
-        }
+        LOGI("[%s] SDK_INT spoof skipped (keeping real SDK)", g_app_name);
     }
 
     JNINativeMethod sp[] = {
@@ -1852,80 +2025,36 @@ static void install_jni_hooks(JNIEnv *env) {
         LOGW("[%s] BinderProxy.transactNative hook unavailable", g_app_name);
     }
 
-    JNINativeMethod props_bridge[] = {
-        { "nativeCollectSnapshot", "([Ljava/lang/String;)Ljava/lang/String;",
-          (void *)h_duck_props_snapshot },
+    JNINativeMethod unix_process[] = {
+        { "forkAndExec", "([B[BI[BI[B[IZ)I", (void *)h_unix_fork_exec },
     };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/systemproperties/data/native/SystemPropertiesNativeBridge",
-        props_bridge, 1);
+    g_api->hookJniNativeMethods(env, "java/lang/UNIXProcess", unix_process, 1);
+    if (unix_process[0].fnPtr != (void *)h_unix_fork_exec) {
+        o_unix_fork_exec = (jint (*)(JNIEnv *, jobject, jbyteArray, jbyteArray,
+                                     jint, jbyteArray, jint, jbyteArray,
+                                     jintArray, jboolean))unix_process[0].fnPtr;
+        LOGI("[%s] UNIXProcess.forkAndExec hook installed", g_app_name);
+    } else if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
 
-    JNINativeMethod pif_bridge[] = {
-        { "nativeCollectSnapshot", "([Ljava/lang/String;)Ljava/lang/String;",
-          (void *)h_duck_pif_snapshot },
+    JNINativeMethod process_impl[] = {
+        { "forkAndExec", "(I[B[B[BI[BI[B[IZ)I", (void *)h_process_fork_exec },
     };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/playintegrityfix/data/native/PlayIntegrityFixNativeBridge",
-        pif_bridge, 1);
+    g_api->hookJniNativeMethods(env, "java/lang/ProcessImpl", process_impl, 1);
+    if (process_impl[0].fnPtr != (void *)h_process_fork_exec) {
+        o_process_fork_exec = (jint (*)(JNIEnv *, jobject, jint, jbyteArray,
+                                        jbyteArray, jbyteArray, jint,
+                                        jbyteArray, jint, jbyteArray,
+                                        jintArray, jboolean))process_impl[0].fnPtr;
+        LOGI("[%s] ProcessImpl.forkAndExec hook installed", g_app_name);
+    } else if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
 
-    JNINativeMethod dangerous_bridge[] = {
-        { "nativeStatPackages", "([Ljava/lang/String;)Ljava/lang/String;",
-          (void *)h_duck_dangerous_stat },
-    };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/dangerousapps/data/native/DangerousAppsNativeBridge",
-        dangerous_bridge, 1);
-
-    JNINativeMethod memory_bridge[] = {
-        { "nativeCollectSnapshot", "()Ljava/lang/String;",
-          (void *)h_duck_memory_snapshot },
-    };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/memory/data/native/MemoryNativeBridge",
-        memory_bridge, 1);
-
-    JNINativeMethod lsposed_bridge[] = {
-        { "nativeCollectSnapshot", "()Ljava/lang/String;",
-          (void *)h_duck_lsposed_snapshot },
-    };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/lsposed/data/native/LSPosedNativeBridge",
-        lsposed_bridge, 1);
-
-    JNINativeMethod zygisk_bridge[] = {
-        { "nativeCollectSnapshot", "()Ljava/lang/String;",
-          (void *)h_duck_zygisk_snapshot },
-    };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/zygisk/data/native/ZygiskNativeBridge",
-        zygisk_bridge, 1);
-
-    JNINativeMethod su_bridge[] = {
-        { "nativeCollectSnapshot", "()Ljava/lang/String;",
-          (void *)h_duck_su_snapshot },
-    };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/su/data/native/SuNativeBridge",
-        su_bridge, 1);
-
-    JNINativeMethod cgroup_bridge[] = {
-        { "nativeCollectSnapshot", "()Ljava/lang/String;",
-          (void *)h_duck_cgroup_snapshot },
-    };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/nativeroot/data/native/CgroupProcessLeakNativeBridge",
-        cgroup_bridge, 1);
-
-    JNINativeMethod native_root_bridge[] = {
-        { "nativeCollectSnapshot", "(Z)Ljava/lang/String;",
-          (void *)h_duck_native_root_snapshot },
-    };
-    hook_duck_native_methods(env,
-        "com/eltavine/duckdetector/features/nativeroot/data/native/NativeRootNativeBridge",
-        native_root_bridge, 1);
-    LOGI("[%s] Duck native bridge hooks requested", g_app_name);
-    g_jni_installed = true;
+    g_core_jni_installed = true;
     pthread_mutex_unlock(&g_jni_lock);
+    (void)install_duck_bridge_hooks(env);
 }
 
 static void install_jni_hooks_from_vm() {
@@ -1944,19 +2073,20 @@ static void install_jni_hooks_from_vm() {
 }
 
 static void *delayed_hook_worker(void *) {
-    const unsigned int delays[] = { 1, 2, 3, 5, 8, 13, 21, 34 };
-    for (unsigned int d : delays) {
-        sleep(d);
-        (void)register_plt_hooks();
+    const unsigned int delays_ms[] = {
+        0, 40, 60, 100, 160, 240, 360, 520, 760, 1100, 1600, 2400, 3600, 5400
+    };
+    for (unsigned int d : delays_ms) {
+        if (d) usleep(d * 1000);
         install_jni_hooks_from_vm();
-        LOGD("[%s] delayed PLT pass done", g_app_name);
+        LOGD("[%s] delayed JNI bridge pass done", g_app_name);
     }
     return nullptr;
 }
 
-static void start_delayed_hooks() {
-    if (g_hooks_started) return;
-    g_hooks_started = true;
+static void start_delayed_jni_hooks() {
+    if (g_retry_started) return;
+    g_retry_started = true;
     pthread_t t;
     if (pthread_create(&t, nullptr, delayed_hook_worker, nullptr) == 0) {
         pthread_detach(t);
@@ -1984,15 +2114,10 @@ public:
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
         if (!target) return;
         install_jni_hooks(env);
-        int hooked = 0;
         int sdk = get_runtime_sdk(env);
-        if (sdk >= 36) {
-            LOGI("[%s] native PLT hooks skipped on sdk=%d", g_app_name, sdk);
-        } else {
-            hooked = register_plt_hooks();
-            start_delayed_hooks();
-        }
-        LOGI("[%s] %s active, plt_libs=%d", g_app_name, MODULE_VERSION, hooked);
+        start_delayed_jni_hooks();
+        LOGI("[%s] broad native PLT hooks disabled on sdk=%d", g_app_name, sdk);
+        LOGI("[%s] %s active", g_app_name, MODULE_VERSION);
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {

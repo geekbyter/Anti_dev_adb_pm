@@ -1,14 +1,16 @@
 # anti_dev_pm_zygisk
 
 Author: geekbyte  
-Version: v2.4.3
+Version: v2.5.3
 
 Standalone Zygisk module for DuckDetector visibility checks.
 
 This module does not hide SukiSU or any other app from Android itself. It does
-not run `pm hide`, does not change appops, and does not disable ADB/developer
-options. The bypass is process-local: only DuckDetector's observations are
-sanitized.
+not run `pm hide`, and does not disable ADB/developer options. On MIUI/HyperOS,
+the module grants DuckDetector the real installed-app inventory appop
+`MIUIOP(10022)` when that appop exists, because `QUERY_ALL_PACKAGES` can be
+granted while the ROM-level inventory gate is still `ignore`. Other bypass work
+is process-local: only DuckDetector's observations are sanitized.
 
 ## Scope
 
@@ -21,18 +23,28 @@ com.eltavine.duckdetector
 It is intentionally separate from `selinux_avc_bypass_zygisk` and does not hook
 audit/logcat/SELinux policy paths.
 
+Runtime service:
+
+```text
+module/service.sh
+```
+
+The service only touches DuckDetector's MIUI/HyperOS installed-app inventory
+appop. It skips non-MIUI ROMs and ROMs where op `10022` is unsupported.
+
 ## What It Hooks
 
 - `android.os.SystemProperties` native getters.
-- Native property imports:
-  - `__system_property_get`
-  - `__system_property_read`
-  - `__system_property_read_callback`
-  - `property_get`
 - `android.os.BinderProxy.transactNative`, used to sanitize Binder replies from
-  PackageManager and Settings-related calls.
-- DuckDetector's own native bridge snapshots via JNI hook and `dlsym`
-  interception:
+  PackageManager and Settings-related calls. Direct PackageManager lookups for
+  risky package names are rewritten before the Binder call, so Android returns a
+  normal not-found result instead of a half-sanitized PackageInfo.
+- `module/service.sh`, used to grant DuckDetector `MIUIOP(10022)=allow` on
+  MIUI/HyperOS so PackageManager inventory is not reported as ROM-scoped.
+- `java.lang.UNIXProcess` / `java.lang.ProcessImpl` native process creation for
+  Duck's `getprop` subprocess snapshots. Only `getprop` is redirected, and only
+  ADB/developer property lines are filtered from that snapshot.
+- DuckDetector's own native bridge snapshots via retryable JNI hooks:
   - SystemPropertiesNativeBridge
   - PlayIntegrityFixNativeBridge
   - DangerousAppsNativeBridge
@@ -40,31 +52,24 @@ audit/logcat/SELinux policy paths.
   - LSPosedNativeBridge
   - ZygiskNativeBridge
   - SuNativeBridge
-  - NativeRootNativeBridge
   - CgroupProcessLeakNativeBridge
-- `getprop` process probes in DuckDetector.
-- KernelSU manager fingerprint probes in DuckDetector:
-  - direct `IPackageManager` lookups for known KernelSU/SukiSU manager names
-  - `KSU_*` / `KERNELSU` environment-style probes
-  - `prctl(0xDEADBEEF, ...)` KernelSU magic probe
-- Native file/path probes commonly used by DuckDetector:
-  - `open`, `open64`, `openat`, `fopen`, `read`, `close`
-  - `access`, `faccessat`, `faccessat2`
-  - `stat`, `lstat`, `fstatat`, `statx`
-  - `readlink`, `readlinkat`, `realpath`
-  - `getxattr`, `lgetxattr`
-  - `opendir`, `readdir`, `closedir`
-  - `execve`, `execv`, `execvp`, `posix_spawn`, `popen`
+  - NativeRootNativeBridge
+
+v2.5.0 does not enable broad native PLT/file hooks in DuckDetector's main
+process. Those hooks were fragile on Android 13/14 and could make DuckDetector
+hang or open to a black screen. The module now relies on framework JNI hooks,
+Binder request/reply sanitizing, and confirmed Duck native bridge hooks.
 
 ## Covered Signals
 
-ADB/developer properties are reported to DuckDetector as normal-device values,
-for example:
+ADB/developer properties are reported to DuckDetector as normal-device values.
+USB config properties are derived from the real device value with only the
+`adb` token removed, so device-specific modes are preserved where possible:
 
 ```text
-persist.sys.usb.config=mtp
-sys.usb.config=mtp
-sys.usb.state=mtp
+persist.sys.usb.config=mtp        # example: mtp,adb -> mtp
+sys.usb.config=mtp                # example: adb -> mtp
+sys.usb.state=mtp                 # example: diag,adb -> diag
 init.svc.adbd=stopped
 service.adb.root=0
 persist.adb.tcp.port=-1
@@ -93,9 +98,30 @@ com.omarea.vtools
 com.omarea.scene
 ```
 
-The module also suppresses Duck-visible path evidence such as `/data/adb`,
-`/sdcard/Android/data/<pkg>`, `/sdcard/Android/obb/<pkg>`, APK paths containing
-these package names, and several known risky-app residue paths.
+Duck native bridge snapshots for native root, SU, Zygisk, LSPosed, memory, and
+dangerous-app probes are normalized in-process. Broad filesystem path hooks are
+kept disabled by default in v2.5.0 for compatibility.
+
+MIUI/HyperOS inventory visibility is handled by a real appop grant:
+
+```text
+cmd appops set com.eltavine.duckdetector 10022 allow
+```
+
+The module runs that command from `service.sh` during Magisk late-start service,
+not from ADB. The previous appop output is saved to:
+
+```text
+/data/adb/anti_dev_pm_zygisk/miuiop10022.prev
+```
+
+`customize.sh` applies the grant once during module installation, and
+`service.sh` starts a low-frequency worker that re-checks the mode because
+HyperOS/MIUI can rewrite this appop after boot or after a permission UI change.
+`uninstall.sh` stops the worker and restores the saved mode when possible. This
+addresses Duck's `Inventory visibility limited` result on ROMs where
+`android.permission.QUERY_ALL_PACKAGES` is granted but `MIUIOP(10022)` remains
+`ignore`.
 
 ## Android 16 Compatibility
 
@@ -118,6 +144,30 @@ and newer. On these builds, repeated PLT registration attempts fail and can
 disturb HWUI/Vulkan surface timing. The module keeps the process-local JNI
 hooks for `SystemProperties` and DuckDetector native bridge snapshots, but does
 not keep a delayed worker thread in the app process.
+
+v2.5.0 applies that conservative model to Android 10-16. It keeps the real SDK
+level, disables broad PLT hooks on all supported versions, preserves USB
+configuration tokens other than `adb`, and retries Duck native bridge hooks
+until late-loaded classes are actually hooked. This fixes Android 13/14
+black-screen or click-to-open failures caused by failed PLT passes.
+
+v2.5.1 keeps the v2.5.0 compatibility rollback but moves Duck native bridge
+retry to the early startup window. It also sanitizes Duck's `getprop`
+subprocess snapshot without restoring broad PLT/file hooks. This prevents
+memory, property, and nativeStat probes from running before their bridge
+methods are replaced while keeping Android 13/14 startup stable.
+
+v2.5.2 adds a ROM-scoped inventory visibility fix for MIUI/HyperOS. During
+late-start service, the module checks whether DuckDetector is installed and
+whether appop `10022` exists. If so, it sets that op to `allow` so DuckDetector's
+own PackageManager inventory is not limited by the ROM-level installed-app-list
+gate. Non-MIUI ROMs and ROMs without op `10022` are skipped.
+
+v2.5.3 makes the inventory fix durable. The installer now marks module scripts
+executable, applies DuckDetector's `MIUIOP(10022)=allow` during install when
+available, the native log version matches the module version, and `service.sh`
+starts a low-frequency worker that keeps DuckDetector's `MIUIOP(10022)` at
+`allow` if HyperOS/MIUI rewrites it later.
 
 ## Why v2.1 Changed
 
@@ -147,7 +197,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\package.ps1
 Output:
 
 ```text
-C:\Users\admin\Documents\dirtysepolicy\anti_dev_pm_zygisk-v2.4.3.zip
+C:\Users\admin\Documents\dirtysepolicy\anti_dev_pm_zygisk-v2.5.3.zip
 ```
 
 ## GitHub Cloud Build
@@ -159,7 +209,7 @@ Push this folder as the repository root. The workflow at
 ## Install
 
 ```sh
-su -c "magisk --install-module /sdcard/anti_dev_pm_zygisk-v2.4.3.zip"
+su -c "magisk --install-module /sdcard/anti_dev_pm_zygisk-v2.5.3.zip"
 su -c reboot
 ```
 
@@ -170,6 +220,8 @@ Zygisk module loaded.
 
 ```sh
 su -c "logcat -d -s DuckVisBypass"
+su -c "logcat -d -s AntiDevPmZygisk"
+cmd appops get com.eltavine.duckdetector 10022
 pm list packages | grep sukisu
 settings get global adb_enabled
 ```
@@ -177,11 +229,15 @@ settings get global adb_enabled
 Expected:
 
 - `logcat` shows `DuckVisBypass` only for DuckDetector.
+- `logcat` eventually shows `Duck native bridge hooks ready=9/9`.
+- On MIUI/HyperOS, `cmd appops get com.eltavine.duckdetector 10022` shows
+  `MIUIOP(10022): allow`.
 - SukiSU still appears in normal system/package-manager output.
 - ADB/developer settings keep their real values outside DuckDetector.
 - DuckDetector receives sanitized observations inside its own process.
 
 ## Notes
 
-This module is intentionally narrow. It avoids changing persistent system state
-so it can run alongside AVC/audit modules with fewer side effects.
+This module is intentionally narrow. Its only persistent system-state change is
+DuckDetector's MIUI/HyperOS installed-app inventory appop. Other package,
+property, and native observations remain process-local to DuckDetector.
