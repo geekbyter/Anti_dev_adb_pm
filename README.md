@@ -1,16 +1,19 @@
 # anti_dev_pm_zygisk
 
 Author: geekbyte  
-Version: v2.5.3
+Version: v2.5.7
 
 Standalone Zygisk module for DuckDetector visibility checks.
 
 This module does not hide SukiSU or any other app from Android itself. It does
 not run `pm hide`, and does not disable ADB/developer options. On MIUI/HyperOS,
-the module grants DuckDetector the real installed-app inventory appop
-`MIUIOP(10022)` when that appop exists, because `QUERY_ALL_PACKAGES` can be
-granted while the ROM-level inventory gate is still `ignore`. Other bypass work
-is process-local: only DuckDetector's observations are sanitized.
+the module grants the real installed-app inventory appop `MIUIOP(10022)` to
+DuckDetector by default. It also restores the old DuckDetector-scoped SDK 29
+inventory fallback, because DuckDetector treats Android 30+ visible package
+counts `<=10` as scoped visibility and counts `<60` as under-report risk. Extra
+packages are only handled when you add them to
+`/data/adb/anti_dev_pm_zygisk/target.txt`. DuckDetector process observation
+hooks remain scoped to DuckDetector only.
 
 ## Scope
 
@@ -23,24 +26,32 @@ com.eltavine.duckdetector
 It is intentionally separate from `selinux_avc_bypass_zygisk` and does not hook
 audit/logcat/SELinux policy paths.
 
-Runtime service:
+Runtime inventory service:
 
 ```text
 module/service.sh
+module/post-fs-data.sh
+module/inventory_worker.sh
+/data/adb/anti_dev_pm_zygisk/inventory_worker.sh
+/data/adb/service.d/anti_dev_pm_inventory.sh
 ```
 
-The service only touches DuckDetector's MIUI/HyperOS installed-app inventory
-appop. It skips non-MIUI ROMs and ROMs where op `10022` is unsupported.
+The service only touches the MIUI/HyperOS installed-app inventory appop for
+DuckDetector and manually configured targets. It skips non-MIUI ROMs by default
+and skips ROMs where op `10022` is unsupported.
 
 ## What It Hooks
 
 - `android.os.SystemProperties` native getters.
+- `android.os.Build.VERSION.SDK_INT` and `RESOURCES_SDK_INT` inside the
+  DuckDetector process only, downgraded to 29 as an inventory fallback.
 - `android.os.BinderProxy.transactNative`, used to sanitize Binder replies from
   PackageManager and Settings-related calls. Direct PackageManager lookups for
   risky package names are rewritten before the Binder call, so Android returns a
   normal not-found result instead of a half-sanitized PackageInfo.
-- `module/service.sh`, used to grant DuckDetector `MIUIOP(10022)=allow` on
-  MIUI/HyperOS so PackageManager inventory is not reported as ROM-scoped.
+- `module/inventory_worker.sh`, used to grant `MIUIOP(10022)=allow` on
+  MIUI/HyperOS to DuckDetector and packages listed in `target.txt`, so
+  PackageManager inventory is not reported as ROM-scoped for those targets.
 - `java.lang.UNIXProcess` / `java.lang.ProcessImpl` native process creation for
   Duck's `getprop` subprocess snapshots. Only `getprop` is redirected, and only
   ADB/developer property lines are filtered from that snapshot.
@@ -105,31 +116,52 @@ kept disabled by default in v2.5.0 for compatibility.
 MIUI/HyperOS inventory visibility is handled by a real appop grant:
 
 ```text
-cmd appops set com.eltavine.duckdetector 10022 allow
+cmd appops set <package> 10022 allow
 ```
 
-The module runs that command from `service.sh` during Magisk late-start service,
-not from ADB. The previous appop output is saved to:
+The module runs that command from its own install/service scripts, not from
+ADB. Previous appop outputs are saved under:
 
 ```text
-/data/adb/anti_dev_pm_zygisk/miuiop10022.prev
+/data/adb/anti_dev_pm_zygisk/<package>.prev
 ```
 
-`customize.sh` applies the grant once during module installation, and
-`service.sh` starts a low-frequency worker that re-checks the mode because
-HyperOS/MIUI can rewrite this appop after boot or after a permission UI change.
-`uninstall.sh` stops the worker and restores the saved mode when possible. This
-addresses Duck's `Inventory visibility limited` result on ROMs where
-`android.permission.QUERY_ALL_PACKAGES` is granted but `MIUIOP(10022)` remains
-`ignore`.
+`customize.sh` applies one pass during module installation. It stages the worker
+to `/data/adb/anti_dev_pm_zygisk/inventory_worker.sh`, so service.d does not
+depend on the module directory being readable from every boot shell context.
+`post-fs-data.sh`, `service.sh`, and `/data/adb/service.d/anti_dev_pm_inventory.sh`
+all start that staged worker; the worker handles DuckDetector plus package
+names listed in `target.txt` and re-checks the mode because HyperOS/MIUI can
+rewrite this appop after boot or after a permission UI change. `uninstall.sh`
+stops the worker and restores saved modes when possible.
+This addresses DuckDetector's `Inventory visibility limited` result on ROMs
+where `android.permission.QUERY_ALL_PACKAGES` is granted but `MIUIOP(10022)`
+remains `ignore`.
+
+Optional configuration:
+
+```text
+/data/adb/anti_dev_pm_zygisk/inventory.conf
+/data/adb/anti_dev_pm_zygisk/target.txt
+```
+
+Supported `inventory.conf` keys:
+
+```text
+poll_seconds=5         # default worker interval after startup burst
+force_non_miui=0       # default: do not touch non-MIUI/HyperOS ROMs
+```
+
+`target.txt` can list extra package names, one per line. The module always
+includes DuckDetector as a built-in target.
 
 ## Android 16 Compatibility
 
-v2.4.1 keeps the real `Build.VERSION.SDK_INT` and `RESOURCES_SDK_INT` on
+v2.4.1 kept the real `Build.VERSION.SDK_INT` and `RESOURCES_SDK_INT` on
 Android 16/API 36 and newer. Older builds used a process-local SDK downgrade for
-some DuckDetector inventory checks, but that can break new framework/UI
+some DuckDetector inventory checks, but that could break new framework/UI
 compatibility paths and cause a black screen on Android 16. Other package,
-property, Binder, and native probe hooks are unchanged.
+property, Binder, and native probe hooks were unchanged.
 
 v2.4.2 further narrows Zygisk activation on Android 16-era DuckDetector builds.
 The module runs in the main DuckDetector process and the explicit
@@ -169,6 +201,28 @@ available, the native log version matches the module version, and `service.sh`
 starts a low-frequency worker that keeps DuckDetector's `MIUIOP(10022)` at
 `allow` if HyperOS/MIUI rewrites it later.
 
+v2.5.4 generalizes the inventory fix. Instead of only targeting DuckDetector,
+the worker automatically handles third-party packages that declare
+`QUERY_ALL_PACKAGES`, adds a `post-fs-data.sh` launcher for earlier and more
+reliable startup, and keeps per-package previous appop states for uninstall.
+
+v2.5.5 improves worker reliability on KernelSU/Hybrid Mount environments by
+installing a `/data/adb/service.d/anti_dev_pm_inventory.sh` launcher. The worker
+now does full package discovery periodically and faster lightweight passes over
+the cached target list between full scans.
+
+v2.5.6 narrows the inventory worker again. It no longer auto-handles all apps
+that request `QUERY_ALL_PACKAGES`; it only handles DuckDetector by default plus
+packages manually listed in `/data/adb/anti_dev_pm_zygisk/target.txt`.
+
+v2.5.7 restores a DuckDetector-process-only SDK 29 inventory fallback after
+JADX confirmed DuckDetector's inventory card is Java-side `getInstalledApplications`
+count logic: Android 30+ counts `<=10` are treated as scoped visibility and
+full-inventory counts `<60` are treated as under-report risk. It also stages the
+inventory worker under `/data/adb/anti_dev_pm_zygisk`, fixes final-line target
+reading, uses absolute `pm/cmd/log` paths, and logs missing, failed,
+unsupported, and handled appop targets separately.
+
 ## Why v2.1 Changed
 
 `Settings.Global/Secure.getInt` and `ApplicationPackageManager` methods are
@@ -197,7 +251,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\package.ps1
 Output:
 
 ```text
-C:\Users\admin\Documents\dirtysepolicy\anti_dev_pm_zygisk-v2.5.3.zip
+C:\Users\admin\Documents\dirtysepolicy\anti_dev_pm_zygisk-v2.5.7.zip
 ```
 
 ## GitHub Cloud Build
@@ -209,7 +263,7 @@ Push this folder as the repository root. The workflow at
 ## Install
 
 ```sh
-su -c "magisk --install-module /sdcard/anti_dev_pm_zygisk-v2.5.3.zip"
+su -c "magisk --install-module /sdcard/anti_dev_pm_zygisk-v2.5.7.zip"
 su -c reboot
 ```
 
@@ -229,15 +283,16 @@ settings get global adb_enabled
 Expected:
 
 - `logcat` shows `DuckVisBypass` only for DuckDetector.
+- `logcat` shows `Duck inventory SDK spoof active: SDK_INT <real>->29`.
 - `logcat` eventually shows `Duck native bridge hooks ready=9/9`.
-- On MIUI/HyperOS, `cmd appops get com.eltavine.duckdetector 10022` shows
-  `MIUIOP(10022): allow`.
+- On MIUI/HyperOS, DuckDetector shows `MIUIOP(10022): allow` when checked with
+  `cmd appops get com.eltavine.duckdetector 10022`.
 - SukiSU still appears in normal system/package-manager output.
 - ADB/developer settings keep their real values outside DuckDetector.
 - DuckDetector receives sanitized observations inside its own process.
 
 ## Notes
 
-This module is intentionally narrow. Its only persistent system-state change is
-DuckDetector's MIUI/HyperOS installed-app inventory appop. Other package,
-property, and native observations remain process-local to DuckDetector.
+This module intentionally keeps the inventory appop fix scoped to DuckDetector
+unless you add package names to `target.txt`. Other package, property, and
+native observations remain process-local to DuckDetector.

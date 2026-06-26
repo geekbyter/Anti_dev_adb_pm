@@ -24,26 +24,22 @@ stage_worker() {
     fi
 
     if [ ! -r "$WORKER" ]; then
-        logi "inventory worker missing: worker=$WORKER src=$WORKER_SRC"
+        logi "inventory worker missing from post-fs-data: worker=$WORKER src=$WORKER_SRC"
         return 1
     fi
     return 0
 }
 
-stage_worker || exit 1
+stage_worker || exit 0
 
 old_pid="$(cat "$PID_FILE" 2>/dev/null)"
 if [ -n "$old_pid" ] && kill -0 "$old_pid" >/dev/null 2>&1; then
     old_cmd="$(tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null)"
     case "$old_cmd" in
-        *"$WORKER"*)
-            logi "inventory worker already running: pid=$old_pid"
-            exit 0
-            ;;
+        *"$WORKER"*) exit 0 ;;
         *)
             kill "$old_pid" >/dev/null 2>&1
             sleep 1
-            logi "inventory worker replaced old pid=$old_pid cmd=$old_cmd"
             ;;
     esac
 fi
@@ -56,4 +52,4 @@ fi
 
 worker_pid="$!"
 printf '%s\n' "$worker_pid" > "$PID_FILE"
-logi "inventory worker launched: pid=$worker_pid"
+logi "inventory worker launched from post-fs-data: pid=$worker_pid"

@@ -1,4 +1,4 @@
-// anti_dev_pm_zygisk v2.5.3
+// anti_dev_pm_zygisk v2.5.7
 // DuckDetector-scoped observation bypass:
 //   - Does not hide, disable, stop, or uninstall any real package/service.
 //   - Spoofs Duck-visible ADB/developer system properties.
@@ -26,7 +26,7 @@
 
 #include "zygisk.hpp"
 
-#define MODULE_VERSION "v2.5.3"
+#define MODULE_VERSION "v2.5.7"
 #define LOG_TAG "DuckVisBypass"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -64,6 +64,8 @@ static pthread_mutex_t g_jni_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_bridge_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_core_jni_installed = false;
 static bool g_retry_started = false;
+static bool g_inventory_sdk_spoofed = false;
+static int g_real_sdk_before_spoof = -1;
 static char g_app_name[128] = "?";
 
 // ---------------------------------------------------------------------------
@@ -216,6 +218,70 @@ static int get_runtime_sdk(JNIEnv *env) {
     if (sdk) value = env->GetStaticIntField(version, sdk);
     env->DeleteLocalRef(version);
     return value;
+}
+
+static bool set_static_int_field_if_at_least(JNIEnv *env, jclass cls,
+                                             const char *name, jint floor,
+                                             jint spoof_value,
+                                             jint *old_value) {
+    if (old_value) *old_value = -1;
+    if (!env || !cls || !name) return false;
+
+    jfieldID field = env->GetStaticFieldID(cls, name, "I");
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    if (!field) return false;
+
+    jint cur = env->GetStaticIntField(cls, field);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    if (old_value) *old_value = cur;
+    if (cur < floor) return false;
+
+    env->SetStaticIntField(cls, field, spoof_value);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+static void install_inventory_sdk_spoof(JNIEnv *env) {
+    if (!env) return;
+    jclass version = env->FindClass("android/os/Build$VERSION");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (!version) {
+        LOGW("[%s] Duck inventory SDK spoof unavailable: Build.VERSION missing",
+             g_app_name);
+        return;
+    }
+
+    jint old_sdk = -1;
+    jint old_res_sdk = -1;
+    // DuckDetector 的 inventory 判定只在 Android 30+ 启用；这里仅在
+    // DuckDetector 进程内降到 29，避免 MIUI/HMA 时序把可见包数量裁成低值。
+    bool sdk_changed = set_static_int_field_if_at_least(
+        env, version, "SDK_INT", 30, 29, &old_sdk);
+    bool res_changed = set_static_int_field_if_at_least(
+        env, version, "RESOURCES_SDK_INT", 30, 29, &old_res_sdk);
+    env->DeleteLocalRef(version);
+
+    if (old_sdk > 0 && g_real_sdk_before_spoof < 0) {
+        g_real_sdk_before_spoof = old_sdk;
+    }
+    g_inventory_sdk_spoofed = sdk_changed || res_changed;
+
+    if (g_inventory_sdk_spoofed) {
+        LOGI("[%s] Duck inventory SDK spoof active: SDK_INT %d->29 RESOURCES_SDK_INT %d->29",
+             g_app_name, (int)old_sdk, (int)old_res_sdk);
+    } else {
+        LOGI("[%s] Duck inventory SDK spoof checked: SDK_INT=%d RESOURCES_SDK_INT=%d",
+             g_app_name, (int)old_sdk, (int)old_res_sdk);
+    }
 }
 
 static int (*o_sys_prop_get)(const char *, char *) = nullptr;
@@ -1988,9 +2054,7 @@ static void install_jni_hooks(JNIEnv *env) {
         return;
     }
 
-    {
-        LOGI("[%s] SDK_INT spoof skipped (keeping real SDK)", g_app_name);
-    }
+    install_inventory_sdk_spoof(env);
 
     JNINativeMethod sp[] = {
         { "native_get", "(Ljava/lang/String;)Ljava/lang/String;", (void *)h_sp_get1 },
@@ -2114,7 +2178,8 @@ public:
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
         if (!target) return;
         install_jni_hooks(env);
-        int sdk = get_runtime_sdk(env);
+        int sdk = g_real_sdk_before_spoof > 0 ?
+            g_real_sdk_before_spoof : get_runtime_sdk(env);
         start_delayed_jni_hooks();
         LOGI("[%s] broad native PLT hooks disabled on sdk=%d", g_app_name, sdk);
         LOGI("[%s] %s active", g_app_name, MODULE_VERSION);

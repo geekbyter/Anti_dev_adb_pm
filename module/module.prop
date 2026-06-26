@@ -1,7 +1,7 @@
 id=anti_dev_pm_zygisk
 name=Anti-Dev-Adb-pm
-version=v2.5.3
-versionCode=20503
+version=v2.5.7
+versionCode=20507
 author=geekbyte
-description=DuckDetector-scoped visibility module: sanitizes SystemProperties, Binder PackageManager/Settings requests, Duck native root/SU/memory/property snapshots, risky-app probes, and grants MIUI/HyperOS inventory visibility to DuckDetector. No pm hide, no ADB disable.
+description=DuckDetector-scoped visibility module with inventory SDK fallback plus MIUI/HyperOS appop fixer. Sanitizes DuckDetector process observations. No pm hide, no ADB disable.
 updateJson=
